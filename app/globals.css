@@ -401,6 +401,14 @@ a {
   font-size: 8px;
 }
 
+.sync-note.sync-warning {
+  color: #9a5425;
+}
+
+.sync-note.sync-warning i {
+  background: #d47b36;
+}
+
 .weekbar {
   margin: 0 calc(var(--page-gutter) * -1);
   padding: 13px var(--page-gutter);

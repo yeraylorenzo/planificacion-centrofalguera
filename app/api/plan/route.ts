@@ -32,6 +32,12 @@ type ObservationRequestBody = {
 const GOOGLE_PLAN_SERVICE_URL =
   "https://script.google.com/macros/s/AKfycbxCi7YD5EAdXD66EfJaL_-elQdtpNGb6m_U0i1zaddPCWLsN329XWXW-QJ5rdPauG2a/exec";
 
+// La caché persistente está en Apps Script. Esta caché de instancia evita
+// solicitudes duplicadas sin mantener una planificación desactualizada horas.
+const EDGE_PLAN_FRESH_MS = 2 * 60_000;
+const EDGE_PLAN_STALE_MS = 24 * 60 * 60_000;
+const GOOGLE_PLAN_TIMEOUT_MS = 45_000;
+
 const planCache = new Map<
   string,
   { payload: IndividualPlan; freshUntil: number; staleUntil: number }
@@ -68,9 +74,9 @@ async function fetchIndividualPlan(
 
   const request = (async () => {
     const controller = new AbortController();
-    // Apps Script can take close to a minute on a cold start because it first
-    // rebuilds the private-folder index before reading the athlete workbook.
-    const timeout = setTimeout(() => controller.abort(), 90_000);
+    // La respuesta normal ya llega desde la caché de Apps Script. Si Google no
+    // responde pronto, devolvemos la última versión disponible en esta instancia.
+    const timeout = setTimeout(() => controller.abort(), GOOGLE_PLAN_TIMEOUT_MS);
 
     try {
       const serviceUrl = new URL(GOOGLE_PLAN_SERVICE_URL);
@@ -104,8 +110,8 @@ async function fetchIndividualPlan(
 
       planCache.set(normalizedCode, {
         payload,
-        freshUntil: Date.now() + 6 * 60 * 60_000,
-        staleUntil: Date.now() + 24 * 60 * 60_000,
+        freshUntil: Date.now() + EDGE_PLAN_FRESH_MS,
+        staleUntil: Date.now() + EDGE_PLAN_STALE_MS,
       });
       return payload;
     } finally {
@@ -148,7 +154,9 @@ export async function GET(request: Request) {
     return Response.json(plan, { headers: responseHeaders() });
   } catch (error) {
     const cached = planCache.get(normalizedCode);
-    if (!forceRefresh && cached && cached.staleUntil > Date.now()) {
+    // Un fallo de Google no debe dejar al deportista sin su planificación,
+    // ni siquiera cuando acaba de pulsar "Actualizar".
+    if (cached && cached.staleUntil > Date.now()) {
       return Response.json(cached.payload, { headers: responseHeaders() });
     }
     const timedOut = error instanceof Error && error.name === "AbortError";

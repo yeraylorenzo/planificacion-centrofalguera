@@ -23,7 +23,8 @@ type ObservationState = "idle" | "saving" | "saved" | "error";
 
 const STORAGE_KEY = "centro-falguera-plan-code";
 const PLAN_CACHE_KEY = "centro-falguera-plan-cache-v2";
-const PLAN_CACHE_TTL = 6 * 60 * 60_000;
+// Conserva una apertura inmediata sin ocultar cambios de planificación durante horas.
+const PLAN_CACHE_TTL = 5 * 60_000;
 const TEAM_CODES = new Set(["xuvnacional", "xuv26"]);
 const MONTH_NAMES = [
   "XAN",
@@ -61,7 +62,7 @@ async function fetchIndividualPlan(
   if (forceRefresh) serviceUrl.searchParams.set("refresh", "1");
 
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 100_000);
+  const timeout = window.setTimeout(() => controller.abort(), 55_000);
 
   try {
     const response = await fetch(serviceUrl, {
@@ -277,10 +278,14 @@ export default function Home() {
       window.localStorage.setItem(STORAGE_KEY, cleanCode);
       window.history.replaceState({}, "", "/");
     } catch (caughtError) {
-      setPlan(null);
-      setTeamPlan(null);
-      if (window.localStorage.getItem(STORAGE_KEY) === cleanCode) {
-        window.localStorage.removeItem(STORAGE_KEY);
+      // Si una actualización puntual falla, mantenemos el último plan visible
+      // para no expulsar al deportista mientras Google se recupera.
+      if (!forceRefresh) {
+        setPlan(null);
+        setTeamPlan(null);
+        if (window.localStorage.getItem(STORAGE_KEY) === cleanCode) {
+          window.localStorage.removeItem(STORAGE_KEY);
+        }
       }
       const message =
         caughtError instanceof Error ? caughtError.message : "";
@@ -474,15 +479,21 @@ export default function Home() {
         </div>
       </header>
 
-      <section className="sync-note">
+      <section
+        className={error ? "sync-note sync-warning" : "sync-note"}
+        role={error ? "status" : undefined}
+        aria-live="polite"
+      >
         <i />
-        <span>Planificación sincronizada</span>
-        <small>
-          {new Intl.DateTimeFormat("gl-ES", {
-            hour: "2-digit",
-            minute: "2-digit",
-          }).format(new Date(plan.updatedAt))}
-        </small>
+        <span>{error || "Planificación sincronizada"}</span>
+        {!error && (
+          <small>
+            {new Intl.DateTimeFormat("gl-ES", {
+              hour: "2-digit",
+              minute: "2-digit",
+            }).format(new Date(plan.updatedAt))}
+          </small>
+        )}
       </section>
 
       {selected ? (

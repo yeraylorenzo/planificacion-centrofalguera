@@ -8,8 +8,10 @@ const WEB_APP_CONFIG = Object.freeze({
   settingsSheet: 'WEB',
   exerciseLibrarySheet: 'BASE_EJERCICIOS',
   observationsSheet: 'OBSERVACIÓNS WEB',
+  // El índice de deportistas cambia poco y evita escanear toda la carpeta.
   indexCacheSeconds: 21600, // 6 horas
-  planCacheSeconds: 21600,  // 6 horas
+  // La planificación activa se sirve ligera; 10 min equilibra rapidez y actualización.
+  planCacheSeconds: 600,
 });
 
 function doGet(e) { return handleWebRequest_(e); }
@@ -32,7 +34,7 @@ function handleWebRequest_(e) {
       if (cachedPlan) return jsonOutput_(cachedPlan);
     }
 
-    const match = findPlanByCode_(normalizedCode, forceRefresh);
+    const match = findPlanByCode_(normalizedCode);
     if (!match) return jsonOutput_({ ok: false, error: 'Código de acceso incorrecto.' });
 
     const payload = buildPlanPayload_(match);
@@ -74,7 +76,7 @@ function saveObservation_(e, body) {
     return jsonOutput_({ ok: false, error: 'Faltan datos para gardar o rexistro da sesión.' });
   }
 
-  const match = findPlanByCode_(normalizeCode_(code), false);
+  const match = findPlanByCode_(normalizeCode_(code));
   if (!match) {
     return jsonOutput_({ ok: false, error: 'Código de acceso incorrecto.' });
   }
@@ -190,19 +192,20 @@ function cleanText_(value, maxLength) {
     .slice(0, maxLength);
 }
 
-function findPlanByCode_(wantedCode, forceRefresh) {
-  let index = forceRefresh ? [] : readCacheJson_('plans-index-v2');
+function findPlanByCode_(wantedCode) {
+  // Incluso al actualizar una planificación reutilizamos el índice. Solo se
+  // reconstruye si falta el código o la pestaña WEB cambió de verdad.
+  let index = readCacheJson_('plans-index-v2') || [];
   let match = uniqueMatch_(index, wantedCode);
   if (match && verifyIndexEntry_(match, wantedCode)) return match;
 
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    if (!forceRefresh) {
-      index = readCacheJson_('plans-index-v2');
-      match = uniqueMatch_(index, wantedCode);
-      if (match && verifyIndexEntry_(match, wantedCode)) return match;
-    }
+    index = readCacheJson_('plans-index-v2') || [];
+    match = uniqueMatch_(index, wantedCode);
+    if (match && verifyIndexEntry_(match, wantedCode)) return match;
+
     index = buildIndex_();
     writeCacheJson_('plans-index-v2', index, WEB_APP_CONFIG.indexCacheSeconds);
     match = uniqueMatch_(index, wantedCode);
@@ -283,7 +286,7 @@ function buildPlanPayload_(match) {
   const library = sheets.find(function (sheet) {
     return normalizeLabel_(sheet.getName()) === normalizeLabel_(WEB_APP_CONFIG.exerciseLibrarySheet);
   });
-  const planning = sheets.filter(isPlanningSheet_);
+  const planning = activePlanningSheets_(sheets);
   if (!planning.length) throw new Error('La hoja no contiene pestañas de planificación.');
 
   const data = {};
@@ -299,7 +302,7 @@ function buildPlanPayload_(match) {
     capabilities: {
       observations: true,
     },
-    updatedAt: new Date().toISOString(),
+    updatedAt: DriveApp.getFileById(match.spreadsheetId).getLastUpdated().toISOString(),
   };
 }
 
@@ -309,19 +312,110 @@ function isPlanningSheet_(sheet) {
     (/^MS\d/.test(name) || name.indexOf('POSTRTP') !== -1);
 }
 
+function activePlanningSheets_(sheets) {
+  const planning = sheets.filter(isPlanningSheet_);
+  if (!planning.length) return [];
+
+  const today = Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    'yyyy-MM-dd'
+  );
+  const dated = planning.map(function (sheet) {
+    return {
+      sheet: sheet,
+      order: planningOrder_(sheet),
+      startsOn: planningStartDate_(sheet),
+    };
+  });
+
+  // Elegimos el bloque que ya ha comenzado más recientemente. Si el siguiente
+  // mes está preparado de antemano, el deportista seguirá viendo su MS actual.
+  const current = dated
+    .filter(function (entry) { return entry.startsOn && entry.startsOn <= today; })
+    .sort(function (a, b) {
+      return a.startsOn === b.startsOn
+        ? a.order - b.order
+        : a.startsOn.localeCompare(b.startsOn);
+    });
+  if (current.length) return [current[current.length - 1].sheet];
+
+  // Antes de iniciar una planificación, enseñamos la siguiente disponible.
+  const upcoming = dated
+    .filter(function (entry) { return entry.startsOn && entry.startsOn > today; })
+    .sort(function (a, b) {
+      return a.startsOn === b.startsOn
+        ? a.order - b.order
+        : a.startsOn.localeCompare(b.startsOn);
+    });
+  if (upcoming.length) return [upcoming[0].sheet];
+
+  // Compatibilidad con plantillas antiguas sin fecha visible en las primeras
+  // filas: mantenemos el comportamiento de servir el último MS disponible.
+  dated.sort(function (a, b) { return a.order - b.order; });
+  return [dated[dated.length - 1].sheet];
+}
+
+function planningOrder_(sheet) {
+  const match = normalizeLabel_(sheet.getName()).match(/^MS(\d+)/);
+  return match ? Number(match[1]) : -1;
+}
+
+function planningStartDate_(sheet) {
+  const rowCount = Math.min(sheet.getLastRow(), 80);
+  const columnCount = Math.min(sheet.getLastColumn(), 70);
+  if (!rowCount || !columnCount) return '';
+
+  const rows = sheet.getRange(1, 1, rowCount, columnCount).getDisplayValues();
+  let earliest = '';
+  rows.forEach(function (row) {
+    // Es la misma marca que utiliza el lector de sesiones; así no confundimos
+    // una fecha escrita en una observación con el inicio de un microciclo.
+    if (normalizeLabel_(row[1]) !== 'DATA') return;
+    for (let column = 2; column < row.length; column += 10) {
+      const value = planningDateKey_(row[column]);
+      if (value && (!earliest || value < earliest)) earliest = value;
+    }
+  });
+  return earliest;
+}
+
+function planningDateKey_(value) {
+  const match = String(value || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
+  if (!match) return '';
+  const year = match[3].length === 2 ? '20' + match[3] : match[3];
+  return year + '-' + ('0' + match[2]).slice(-2) + '-' + ('0' + match[1]).slice(-2);
+}
+
 function readUsedRows_(sheet) {
   const lastRow = sheet.getLastRow();
   const lastColumn = sheet.getLastColumn();
   if (!lastRow || !lastColumn) return [];
+
   const rows = sheet.getRange(1, 1, lastRow, lastColumn).getDisplayValues();
-  while (rows.length && rows[rows.length - 1].every(function (v) { return v === ''; })) rows.pop();
-  return rows;
+  while (rows.length && rows[rows.length - 1].every(function (v) { return v === ''; })) {
+    rows.pop();
+  }
+  if (!rows.length) return [];
+
+  // Las plantillas suelen tener fórmulas o formato mucho más allá del bloque
+  // utilizado. No enviamos columnas que no aporten ningún valor visible.
+  let usedColumns = 0;
+  rows.forEach(function (row) {
+    for (let column = row.length - 1; column >= 0; column -= 1) {
+      if (row[column] !== '') {
+        usedColumns = Math.max(usedColumns, column + 1);
+        break;
+      }
+    }
+  });
+  return usedColumns ? rows.map(function (row) { return row.slice(0, usedColumns); }) : [];
 }
 
-function readCachedPlan_(code) { return readCacheJson_('plan-v2-' + code); }
+function readCachedPlan_(code) { return readCacheJson_('plan-v3-' + code); }
 
 function writeCachedPlan_(code, payload) {
-  writeCacheJson_('plan-v2-' + code, payload, WEB_APP_CONFIG.planCacheSeconds);
+  writeCacheJson_('plan-v3-' + code, payload, WEB_APP_CONFIG.planCacheSeconds);
 }
 
 function readCacheJson_(key) {

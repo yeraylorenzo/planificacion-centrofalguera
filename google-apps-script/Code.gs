@@ -369,6 +369,9 @@ function planningStartDate_(sheet) {
   const rows = sheet.getRange(1, 1, rowCount, columnCount).getDisplayValues();
   let earliest = '';
   rows.forEach(function (row) {
+    // Es la misma marca que utiliza el lector de sesiones; así no confundimos
+    // una fecha escrita en una observación con el inicio de un microciclo.
+    if (normalizeLabel_(row[1]) !== 'DATA') return;
     for (let column = 2; column < row.length; column += 10) {
       const value = planningDateKey_(row[column]);
       if (value && (!earliest || value < earliest)) earliest = value;

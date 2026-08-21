@@ -314,23 +314,74 @@ function isPlanningSheet_(sheet) {
 
 function activePlanningSheets_(sheets) {
   const planning = sheets.filter(isPlanningSheet_);
-  const numbered = planning
-    .map(function (sheet) {
-      const match = normalizeLabel_(sheet.getName()).match(/^MS(\d+)/);
-      return { sheet: sheet, order: match ? Number(match[1]) : -1 };
-    })
-    .filter(function (entry) { return entry.order >= 0; })
-    .sort(function (a, b) { return a.order - b.order; });
+  if (!planning.length) return [];
 
-  // La web es un portal de trabajo vigente, no un archivo histórico. Servir
-  // solo el último MS reduce el JSON varios órdenes de magnitud y permite que
-  // la caché de Apps Script se use también en hojas grandes.
-  if (numbered.length) return [numbered[numbered.length - 1].sheet];
-
-  const postRtp = planning.filter(function (sheet) {
-    return normalizeLabel_(sheet.getName()).indexOf('POSTRTP') !== -1;
+  const today = Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    'yyyy-MM-dd'
+  );
+  const dated = planning.map(function (sheet) {
+    return {
+      sheet: sheet,
+      order: planningOrder_(sheet),
+      startsOn: planningStartDate_(sheet),
+    };
   });
-  return postRtp.length ? [postRtp[postRtp.length - 1]] : planning.slice(-1);
+
+  // Elegimos el bloque que ya ha comenzado más recientemente. Si el siguiente
+  // mes está preparado de antemano, el deportista seguirá viendo su MS actual.
+  const current = dated
+    .filter(function (entry) { return entry.startsOn && entry.startsOn <= today; })
+    .sort(function (a, b) {
+      return a.startsOn === b.startsOn
+        ? a.order - b.order
+        : a.startsOn.localeCompare(b.startsOn);
+    });
+  if (current.length) return [current[current.length - 1].sheet];
+
+  // Antes de iniciar una planificación, enseñamos la siguiente disponible.
+  const upcoming = dated
+    .filter(function (entry) { return entry.startsOn && entry.startsOn > today; })
+    .sort(function (a, b) {
+      return a.startsOn === b.startsOn
+        ? a.order - b.order
+        : a.startsOn.localeCompare(b.startsOn);
+    });
+  if (upcoming.length) return [upcoming[0].sheet];
+
+  // Compatibilidad con plantillas antiguas sin fecha visible en las primeras
+  // filas: mantenemos el comportamiento de servir el último MS disponible.
+  dated.sort(function (a, b) { return a.order - b.order; });
+  return [dated[dated.length - 1].sheet];
+}
+
+function planningOrder_(sheet) {
+  const match = normalizeLabel_(sheet.getName()).match(/^MS(\d+)/);
+  return match ? Number(match[1]) : -1;
+}
+
+function planningStartDate_(sheet) {
+  const rowCount = Math.min(sheet.getLastRow(), 80);
+  const columnCount = Math.min(sheet.getLastColumn(), 70);
+  if (!rowCount || !columnCount) return '';
+
+  const rows = sheet.getRange(1, 1, rowCount, columnCount).getDisplayValues();
+  let earliest = '';
+  rows.forEach(function (row) {
+    for (let column = 2; column < row.length; column += 10) {
+      const value = planningDateKey_(row[column]);
+      if (value && (!earliest || value < earliest)) earliest = value;
+    }
+  });
+  return earliest;
+}
+
+function planningDateKey_(value) {
+  const match = String(value || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
+  if (!match) return '';
+  const year = match[3].length === 2 ? '20' + match[3] : match[3];
+  return year + '-' + ('0' + match[2]).slice(-2) + '-' + ('0' + match[1]).slice(-2);
 }
 
 function readUsedRows_(sheet) {
